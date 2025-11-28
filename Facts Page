@@ -1,0 +1,118 @@
+import dash
+from dash import html, dcc, Input, Output
+import pandas as pd
+
+# Load data
+df = pd.read_csv("train_cleaned.csv")
+
+# Pre-calc facts
+oldest = df.loc[df["Age"].idxmax()]
+youngest = df.loc[df["Age"].idxmin()]
+highest_fare = df.loc[df["Fare"].idxmax()]
+most_class = df["Pclass"].mode()[0]
+
+df["FirstName"] = df["Name"].apply(lambda x: str(x).split()[0])
+common_name = df["FirstName"].value_counts().idxmax()
+
+male_surv = df[df["Sex"] == "male"]["Survived"].mean() * 100
+female_surv = df[df["Sex"] == "female"]["Survived"].mean() * 100
+
+# Facts list
+FACTS = [
+    {
+        "title": "Oldest Passenger",
+        "text": f"{oldest['Name']} — {int(oldest['Age'])} years old"
+    },
+    {
+        "title": "Youngest Passenger",
+        "text": f"{youngest['Name']} — {int(youngest['Age'])} years old"
+    },
+    {
+        "title": "Highest Fare Paid",
+        "text": f"{highest_fare['Name']} paid ${highest_fare['Fare']:.2f}"
+    },
+    {
+        "title": "Most Common Ticket Class",
+        "text": f"Class {most_class} was most common"
+    },
+    {
+        "title": "Most Common First Name",
+        "text": f"'{common_name}' was the most frequent name"
+    },
+    {
+        "title": "Survival Rate by Gender",
+        "text": f"Male: {male_surv:.1f}% — Female: {female_surv:.1f}%"
+    }
+]
+
+# Dash app
+app = dash.Dash(__name__)
+app.title = "Titanic Fun Facts"
+
+# Style block
+APP_STYLE = {
+    "backgroundColor": "#050833",
+    "minHeight": "100vh",
+    "padding": "20px"
+}
+
+CARD_STYLE = {
+    "backgroundColor": "white",
+    "padding": "20px",
+    "borderRadius": "18px",
+    "marginBottom": "15px",
+    "boxShadow": "0px 3px 10px rgba(0,0,0,0.25)"
+}
+
+TITLE_STYLE = {
+    "color": "white",
+    "textAlign": "center",
+    "fontSize": "36px",
+    "fontWeight": "700",
+    "marginBottom": "30px"
+}
+
+# Layout
+app.layout = html.Div(style=APP_STYLE, children=[
+
+    html.H1("🚢 Titanic Fun Facts", style=TITLE_STYLE),
+
+    dcc.Input(
+        id="search-input",
+        type="text",
+        placeholder="Search a fact...",
+        style={
+            "width": "100%",
+            "padding": "12px",
+            "borderRadius": "12px",
+            "border": "none",
+            "marginBottom": "20px"
+        }
+    ),
+
+    html.Div(id="facts-container")
+])
+
+
+# Callback — filter facts
+@app.callback(
+    Output("facts-container", "children"),
+    Input("search-input", "value")
+)
+def update_facts(search):
+
+    cards = []
+    for f in FACTS:
+        if not search or search.lower() in f["title"].lower() or search.lower() in f["text"].lower():
+            cards.append(
+                html.Div([
+                    html.Div(f["title"], style={"fontSize": "22px", "fontWeight": "700", "color": "#050833"}),
+                    html.Div(f["text"], style={"fontSize": "17px", "marginTop": "5px"})
+                ], style=CARD_STYLE)
+            )
+
+    return cards
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
