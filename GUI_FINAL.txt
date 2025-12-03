@@ -1,0 +1,551 @@
+import dash
+from dash import html, dcc, Input, Output, State
+import dash_bootstrap_components as dbc
+import plotly.express as px
+import pandas as pd
+from dash import callback_context as ctx
+import numpy as np 
+# We need to simulate the model import since the file isn't available
+import joblib 
+from sklearn.tree import DecisionTreeClassifier # Used for the dummy model
+
+# ====================================================================
+# ===== MODEL SETUP (SIMULATION) =====================================
+# ====================================================================
+
+# 1. Define the exact features your model expects (Crucial for alignment)
+# --- CLEANED UP MODEL FEATURES ---
+MODEL_FEATURES_EXPECTED = [
+    'Pclass', 
+    'Age', 
+    'SibSp', 
+    'Parch', 
+    'HasCabin',          # Changed position
+    'FamilySize',        # Changed position
+    'IsAlone',           # Changed position
+    'Sex_male',          # Changed position
+    'Embarked_Q', 
+    'Embarked_S',
+    'AgeGroup_Child', 
+    'AgeGroup_Senior', 
+    'AgeGroup_Teenager'
+]
+# ---------------------------------
+
+def load_or_create_dummy_model():
+    """
+    Attempts to load the model. If not found, creates and saves a dummy 
+    Decision Tree to ensure the code structure works.
+    """
+    model_path = "DecisionTree.pkl"
+    try:
+        dt = joblib.load(model_path)
+        print(f"Successfully loaded model from {model_path}")
+    except FileNotFoundError:
+        print(f"Model file {model_path} not found. Creating a dummy model.")
+        
+        # Create a tiny dummy training set based on expected features
+        # Pclass, Age, SibSp, Parch, FamilySize, IsAlone, HasCabin, 
+        # Embarked_Q, Embarked_S, AgeGroup_Child, AgeGroup_Senior, AgeGroup_Teenager, Sex_male
+        X_dummy = pd.DataFrame([
+            [1, 30, 0, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0], # 1st, Adult(30), Solo, HasCabin, Embarked S (Female/0)
+            [3, 50, 1, 0, 2, 0, 0, 1, 0, 0, 0, 0, 1], # 3rd, Middle(50), FamilySize 2, NoCabin, Embarked Q (Male/1)
+            [3, 5, 1, 1, 3, 0, 0, 0, 1, 1, 0, 0, 1], # 3rd, Child(5), FamilySize 3, NoCabin, Embarked S (Male/1)
+            [1, 75, 0, 0, 1, 1, 1, 0, 1, 0, 1, 0, 0], # 1st, Senior(75), Solo, HasCabin, Embarked S (Female/0)
+        ], columns=MODEL_FEATURES_EXPECTED)
+        y_dummy = pd.Series([1, 0, 1, 0]) # Survived, Died, Survived, Died
+
+        dt = DecisionTreeClassifier(max_depth=3, random_state=42)
+        dt.fit(X_dummy, y_dummy)
+        
+        # Save the dummy model so subsequent runs load it
+        joblib.dump(dt, model_path) 
+        print(f"Created and saved dummy model to {model_path}")
+
+    return dt
+
+# Load the model globally
+DecisionTree = load_or_create_dummy_model()
+
+
+def prepare_user_data_for_prediction(pclass, sex, age, sibsp, parch, is_alone_input, embarked, has_cabin):
+    """
+    Converts raw user inputs into a DataFrame that matches the trained model's 
+    expected features (MODEL_FEATURES_EXPECTED).
+    
+    NOTE: Renamed 'is_alone' input to 'is_alone_input' for clarity. The actual
+    IsAlone feature is calculated from FamilySize.
+    """
+    
+    # 1. Create a base dictionary of input features
+    # Sex is 0=F, 1=M, but the model uses Sex_male (1/0)
+    data = {
+        'Pclass': [pclass],
+        'Sex_input': [sex], # Use a temporary name to avoid conflict
+        'Age': [age],
+        'SibSp': [sibsp],
+        'Parch': [parch],
+        'Embarked': [embarked.upper() if embarked else 'S'],
+        'HasCabin': [1 if has_cabin == 1 else 0],
+    }
+    
+    df_new = pd.DataFrame(data)
+
+    # 2. Feature Engineering
+    df_new['FamilySize'] = df_new['SibSp'] + df_new['Parch'] + 1
+    
+    # CRITICAL FIX: Calculate IsAlone based on FamilySize
+    df_new['IsAlone'] = df_new['FamilySize'].apply(lambda x: 1 if x == 1 else 0) 
+    
+    # Sex_male
+    df_new['Sex_male'] = df_new['Sex_input'].apply(lambda x: 1 if x == 1 else 0)
+    
+    # AgeGroup encoding
+    df_new['AgeGroup_Child'] = df_new['Age'].apply(lambda x: 1 if 0 <= x <= 12 else 0)
+    df_new['AgeGroup_Teenager'] = df_new['Age'].apply(lambda x: 1 if 12 < x <= 17 else 0)
+    df_new['AgeGroup_Senior'] = df_new['Age'].apply(lambda x: 1 if x > 60 else 0)
+    
+    # Embarked one-hot encoding
+    df_new['Embarked_Q'] = df_new['Embarked'].apply(lambda x: 1 if x == 'Q' else 0)
+    df_new['Embarked_S'] = df_new['Embarked'].apply(lambda x: 1 if x == 'S' else 0) # Embarked_C is the implicit baseline
+    
+    # 3. Align features with the model's expected columns
+    # Select and order the features exactly as the model expects
+    
+    # Create a DataFrame initialized with zeros, matching the expected columns
+    final_features_df = pd.DataFrame(0, index=[0], columns=MODEL_FEATURES_EXPECTED)
+    
+    # Update the values from the engineered features
+    for feature in final_features_df.columns:
+        if feature in df_new.columns:
+            final_features_df[feature] = df_new[feature].iloc[0]
+
+    return final_features_df
+
+
+# ====================================================================
+# ===== LOAD DATA AND PRE-CALCULATIONS (Combined) =====================
+# ====================================================================
+# Assuming "train_cleaned.csv" exists in the current directory
+try:
+    df = pd.read_csv("train_cleaned.csv")
+    df["Pclass"] = df["Pclass"].astype('Int64') 
+except FileNotFoundError:
+    print("Error: 'train_cleaned.csv' not found. Creating dummy data.")
+    data = {'Age': [30, 2, 71, 25, 45, 10, 80, 0.42, 50, 20], 'Fare': [7.25, 10.5, 51.86, 8.05, 7.89, 7.89, 30.0, 8.43, 26.0, 15.0], 
+            'Pclass': [3, 2, 1, 3, 3, 3, 1, 3, 2, 2], 'Sex': ['male', 'female', 'male', 'male', 'female', 'male', 'male', 'male', 'female', 'male'], 
+            'Embarked': ['S', 'S', 'S', 'S', 'Q', 'S', 'C', 'S', 'S', 'Q'], 'Survived': [0, 1, 0, 0, 1, 0, 0, 1, 1, 0],
+            'Name': ['Braund, Mr. Owen Harris', 'Cumings, Mrs. John Bradley (Florence Briggs Thayer)', 'Goldsmith, Mr. Frank John', 
+                     'Olsen, Mr. Knut-Oscar', 'Heikkinen, Miss. Laina', 'Salo, Mr. Johan', 'Oldest, Mr. Senior', 'Youngest, Master. Baby', 
+                     'Survived, Mrs. Test', 'Died, Mr. Test']}
+    df = pd.DataFrame(data)
+
+# Pre-calc facts
+oldest_p = df.loc[df["Age"].idxmax()] if not df.empty and df["Age"].max() is not None and not pd.isna(df["Age"].max()) else {'Name': 'N/A', 'Age': 0}
+youngest_p = df.loc[df["Age"].idxmin()] if not df.empty and df["Age"].min() is not None and not pd.isna(df["Age"].min()) else {'Name': 'N/A', 'Age': 0}
+oldest = df["Age"].max() if not df.empty and df["Age"].max() is not None else 'N/A'
+youngest = df["Age"].min() if not df.empty and df["Age"].min() is not None else 'N/A'
+highest_fare_val = df["Fare"].max() if not df.empty and df["Fare"].max() is not None else 0.0
+most_class_mode = df["Pclass"].mode()
+most_class = most_class_mode[0] if not df.empty and not most_class_mode.empty else 'N/A'
+df["FirstName"] = df["Name"].apply(lambda x: str(x).split()[0].split(',')[0])
+common_name_counts = df["FirstName"].value_counts()
+common_name = common_name_counts.index[0] if not df.empty and not common_name_counts.empty else 'N/A'
+male_surv = df[df["Sex"] == "male"]["Survived"].mean() * 100 if "male" in df["Sex"].unique() and not df[df["Sex"] == "male"].empty else 0
+female_surv = df[df["Sex"] == "female"]["Survived"].mean() * 100 if "female" in df["Sex"].unique() and not df[df["Sex"] == "female"].empty else 0
+
+FACTS = [
+    {"title": "Oldest Passenger", "text": f"{oldest_p['Name'].split(',')[0]} — {int(oldest_p['Age']) if pd.notna(oldest_p['Age']) else 'N/A'} years old"},
+    {"title": "Youngest Passenger", "text": f"{youngest_p['Name'].split(',')[0]} — {youngest_p['Age'] if pd.notna(youngest_p['Age']) else 'N/A'} years old"},
+    {"title": "Highest Fare Paid", "text": f"Highest fare paid was ${highest_fare_val:.2f}"},
+    {"title": "Most Common Ticket Class", "text": f"Class {int(most_class) if pd.notna(most_class) else 'N/A'} was most common"},
+    {"title": "Most Common Last Name", "text": f"'{common_name}' was the most frequent last name"},
+    {"title": "Survival Rate by Gender", "text": f"Male: {male_surv:.1f}% — Female: {female_surv:.1f}%"}
+]
+
+if not df.empty and "Age" in df.columns:
+    df["AgeGroup"] = pd.cut(df["Age"], bins=[0, 18, 40, 60, 100], labels=["Child", "Adult", "Middle Age", "Senior"], right=True, duplicates='drop')
+else:
+    df["AgeGroup"] = pd.Series(dtype='object')
+
+
+# ===== INITIAL CHARTS FUNCTIONS (Unchanged) =====
+def create_age_chart(filtered):
+    if filtered.empty or "Age" not in filtered.columns: return {}
+    temp = filtered.copy()
+    temp["AgeGroup"] = pd.cut(temp["Age"], bins=[0, 18, 40, 60, 100], labels=["Child", "Adult", "Middle", "Senior"], right=True, duplicates='drop').astype(str)
+    survival_age = temp.groupby("AgeGroup", dropna=False)["Survived"].mean().reset_index()
+    fig = px.bar(survival_age, x="AgeGroup", y="Survived", title="Survival Rate by Age Group", color="Survived", color_continuous_scale=["#FF4500", "#1e90ff"])
+    fig.update_layout(template="plotly_dark", paper_bgcolor="#1f2641", plot_bgcolor="#1f2641", font_color="white", yaxis_title="Mean Survival Rate", margin=dict(t=50))
+    return fig
+
+def create_class_chart(filtered):
+    if filtered.empty or "Pclass" not in filtered.columns: return {}
+    fig = px.pie(filtered, names="Pclass", title="Passenger Class Distribution", hole=0.55, color_discrete_sequence=["#1e90ff", "#FFD700", "#FF4500"])
+    fig.update_layout(template="plotly_dark", paper_bgcolor="#1f2641", plot_bgcolor="#1f2641", font_color="white", margin=dict(t=50))
+    return fig
+
+def create_fare_chart(filtered):
+    if filtered.empty or "Fare" not in filtered.columns: return {}
+    fig = px.histogram(filtered, x="Fare", nbins=40, title="Fare Distribution", color_discrete_sequence=["#1e90ff"])
+    fig.update_layout(template="plotly_dark", paper_bgcolor="#1f2641", plot_bgcolor="#1f2641", font_color="white", margin=dict(t=50))
+    return fig
+
+
+# ===== APP SETUP & CUSTOM CSS (Unchanged) =====
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+app.title = "Titanic Multi-Page Dashboard"
+
+custom_css = """
+body { background-color: #2c3e50; color: white; }
+.stat-card { background-color: #34495e !important; border: 1px solid #1e90ff !important; text-align: center; padding: 15px; border-radius: 8px; }
+.stat-number { font-size: 2.5em; font-weight: bold; color: #1e90ff; }
+.chart-card { background-color: #1f2641 !important; padding: 0 !important; border: 1px solid #1e90ff !important; border-radius: 8px; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.4); }
+.search-input { width: 100%; padding: 10px; margin-bottom: 20px; border: 1px solid #1e90ff; border-radius: 5px; background-color: #34495e; color: white; font-size: 16px; }
+.btn-primary { background-color: #1e90ff !important; border-color: #1e90ff !important; color: white !important; font-weight: bold; margin: 5px; }
+.btn-primary:hover { background-color: #0b3d91 !important; border-color: #0b3d91 !important; }
+.btn-danger { background-color: #dc3545 !important; border-color: #dc3545 !important; color: white !important; font-weight: bold; margin: 5px; }
+.btn-danger:hover { background-color: #c82333 !important; border-color: #c82333 !important; }
+.fact-card { background-color: #34495e; border-left: 5px solid #1e90ff; padding: 15px; margin-bottom: 15px; border-radius: 5px; }
+.fact-title { font-weight: bold; font-size: 1.2em; color: #ffd700; }
+.fact-text { color: #cccccc; }
+.dash-dropdown div, .dash-dropdown input { color: black; }
+"""
+
+app.index_string = f'''
+<!DOCTYPE html>
+<html>
+    <head>
+        {{%metas%}}
+        <title>{{%title%}}</title>
+        {{%favicon%}}
+        {{%css%}}
+        <style>
+            {custom_css}
+        </style>
+    </head>
+    <body>
+        {{%app_entry%}}
+        <footer>
+            {{%config%}}
+            {{%scripts%}}
+            {{%renderer%}}
+        </footer>
+    </body>
+</html>
+'''
+
+# ===== LAYOUT (Updated for Page 3 inputs) =====
+app.layout = html.Div(
+    dbc.Container(
+        fluid=True,
+        children=[
+            dcc.Store(id='CurrentPage', data="Page1"),
+            dcc.Store(id='TotalPages', data=4),
+
+            html.Div(
+                id='Page1',
+                style={'display':'block'},
+                children=[
+                    html.H1("🚢 Titanic Data Dashboard Summary", className="text-center text-white mt-4 mb-3"),
+                    dbc.Row(
+                        [
+                            dbc.Col(dcc.Dropdown(id="filter-class", options=[{"label": f"Class {i}", "value": i} for i in sorted(df["Pclass"].unique()) if pd.notna(i)] + [{"label": "All Classes", "value": "all"}], value="all", clearable=False, style={"color": "black"}, className="dash-dropdown"), md=3),
+                            dbc.Col(dcc.Dropdown(id="filter-sex", options=[{"label": s.capitalize(), "value": s} for s in df["Sex"].unique() if pd.notna(s)] + [{"label": "All", "value": "all"}], value="all", clearable=False, style={"color": "black"}, className="dash-dropdown"), md=3),
+                            dbc.Col(dcc.Dropdown(id="filter-embarked", options=[{"label": str(e), "value": e} for e in df["Embarked"].unique() if pd.notna(e)] + [{"label": "All Ports", "value": "all"}], value="all", clearable=False, style={"color": "black"}, className="dash-dropdown"), md=3),
+                            dbc.Col(dcc.Dropdown(id="filter-age", options=[{"label": "All Ages", "value": "all"}, {"label": "0–18 (Children)", "value": "child"}, {"label": "19–40 (Adults)", "value": "adult"}, {"label": "41–60 (Middle Age)", "value": "middle"}, {"label": "60+ (Seniors)", "value": "senior"},], value="all", clearable=False, style={"color": "black"}, className="dash-dropdown"), md=3),
+                        ], className="mb-4"
+                    ),
+                    dbc.Row(
+                        [
+                            dbc.Col(dbc.Card([html.H4("Oldest Age", className="text-white"), html.H2(f"{int(oldest) if pd.notna(oldest) and isinstance(oldest, (int, float, np.number)) else 'N/A'} yrs", className="stat-number")], className="stat-card"), md=4),
+                            dbc.Col(dbc.Card([html.H4("Youngest Age", className="text-white"), html.H2(f"{youngest if pd.notna(youngest) else 'N/A'} yrs", className="stat-card"), dcc.Store(id='YoungestAgeStore', data=youngest)], className="stat-card"), md=4),
+                            dbc.Col(dbc.Card([html.H4("Highest Fare", className="text-white"), html.H2(f"${highest_fare_val:.2f}", className="stat-number")], className="stat-card"), md=4),
+                        ], className="mb-4",
+                    ),
+                    dbc.Row([dbc.Col(dbc.Card(dcc.Graph(id="age-chart", figure=create_age_chart(df)), className="chart-card"), md=6), dbc.Col(dbc.Card(dcc.Graph(id="class-chart", figure=create_class_chart(df)), className="chart-card"), md=6)], className="mb-4"),
+                    dbc.Row([dbc.Col(dbc.Card(dcc.Graph(id="fare-chart", figure=create_fare_chart(df)), className="chart-card"), md=12)], className="mb-4"),
+                ]
+            ),
+
+            html.Div(id='Page2', style={'display':'none'}, children=[
+                html.H1("DECISION TREE LOGIC", className="text-center text-white mt-4 mb-3"),
+                # This image tag is a placeholder for a Decision Tree visualization, which would be highly instructive.
+                
+                html.Div(html.Img(src="/assets/DTree.png", style={'width':'100%', 'height':'auto', 'border':'2px solid #1e90ff', 'border-radius':'8px'}), className="mb-4")
+            ]), 
+            
+            html.Div(
+                id='Page3', 
+                style={'display':'none'},
+                children=[ 
+                    html.H1("📜 SURVIVAL PREDICTOR (Model-Based)", className="text-center text-white mt-4 mb-3"),
+                    dbc.Row([
+                        dbc.Col(dcc.Input(id="pclass_input", type="number", placeholder="CLASS (1, 2, or 3)...", className="search-input", min=1, max=3, step=1), md=4),
+                        dbc.Col(dcc.Input(id="sex_input", type="number", placeholder="SEX (0=F, 1=M)...", className="search-input", min=0, max=1, step=1), md=4),
+                        dbc.Col(dcc.Input(id="age_input", type="number", placeholder="AGE...", className="search-input", min=0, max=100, step=0.1), md=4),
+                    ], className="mb-2"),
+                    dbc.Row([
+                        dbc.Col(dcc.Input(id="sibsp_input", type="number", placeholder="SIBLING/SPOUSE COUNT...", className="search-input", min=0, step=1), md=3),
+                        dbc.Col(dcc.Input(id="parch_input", type="number", placeholder="PARENTS/CHILDREN COUNT...", className="search-input", min=0, step=1), md=3),
+                        dbc.Col(dcc.Input(id="isalone_input", type="number", placeholder="ALONE (1 or 0)...", className="search-input", min=0, max=1, step=1), md=3),
+                        # --- NEW INPUT FOR HASCABIN ---
+                        dbc.Col(dcc.Input(id="has_cabin_input", type="number", placeholder="HAS CABIN (1 or 0)...", className="search-input", min=0, max=1, step=1), md=3),
+                        # -----------------------------
+                    ], className="mb-2"),
+                    dbc.Row([
+                        dbc.Col(dcc.Input(id="embarked_input", type="text", placeholder="PORT (S or Q)...", className="search-input"), md=12),
+                    ], className="mb-2"),
+                    dbc.Row([
+                        # --- MODIFIED BUTTON ROW: Added Clear Button ---
+                        dbc.Col(html.Button('PREDICT SURVIVAL CHANCE', id="PredictSurvivalBtn", n_clicks=0, className="btn btn-primary"), md=6),
+                        dbc.Col(html.Button('CLEAR', id="ClearInputsBtn", n_clicks=0, className="btn btn-danger"), md=6) # New Clear button
+                        # -----------------------------------------------
+                    ], className="mb-4"),
+
+                    html.Div(dcc.Markdown("THE PREDICTION IS:"), style={'color':'#ffd700', 'font-size':'1.5em', 'text-align':'center'}),
+            
+                    html.Div(
+                        style={
+                            'background-image':'linear-gradient(rgba(0,0,0,0.7), rgba(0,0,0,0.7)), url("/assets/Back.jpg")',
+                            'background-repeat': 'no-repeat', 'background-position': 'center', 'background-size': 'cover',
+                            'min-height': '30vh', 'width':'100%', 'margin-bottom': '20px', 'border-radius': '8px', 'border': '1px solid #1e90ff'
+                        }, 
+                        children=[
+                            html.Div(
+                                id="prediction-output",
+                                style={'padding': '50px', 'color':'white', 'font-weight':'bold', 'font-size':'24px', 'min-height': '30vh',
+                                       'display': 'flex', 'align-items': 'center', 'justify-content': 'center', 'text-align': 'center'},
+                                children=[dcc.Markdown("Prediction will appear here.")]
+                            )
+                        ]
+                    ),
+                ]
+            ),
+            
+            html.Div(
+                id='Page4', 
+                style={'display':'none'},
+                children=[
+                    html.H1("🔍 Titanic Fun Facts", className="text-center text-white mt-4 mb-3"),
+                    dcc.Input(id="search-input", type="text", placeholder="Search a fact by title or text...", className="search-input"),
+                    dbc.Row(id="facts-container", className="mt-4"),
+                ]
+            ),
+            
+            dbc.Row(
+                [
+                    dbc.Col(html.Button('« BACK', id="Back", n_clicks=0, className="btn btn-primary"), width={"size": 2, "offset": 4}),
+                    dbc.Col(html.Button('NEXT »', id="Next", n_clicks=0, className="btn btn-primary"), width={"size": 2}),
+                ], className="my-4"
+            )
+        ]
+    )
+)
+
+# ===== PAGE NAVIGATION & CHART CALLBACKS (Unchanged) =====
+@app.callback(
+    Output(component_id="CurrentPage", component_property='data'),
+    [Input(component_id='Next', component_property='n_clicks'), Input(component_id='Back', component_property='n_clicks')],
+    [State('CurrentPage','data'), State('TotalPages', 'data')],
+    prevent_initial_call=True
+)
+def update_current_page(n_clicks_next, n_clicks_back, current_page, total_pages):
+    current_page_num = int(current_page.replace('Page', ''))
+    triggered_id = ctx.triggered_id
+    if triggered_id == 'Next' and n_clicks_next > 0:
+        new_page_num = min(current_page_num + 1, total_pages)
+        return f"Page{new_page_num}"
+    elif triggered_id == 'Back' and n_clicks_back > 0:
+        new_page_num = max(current_page_num - 1, 1)
+        return f"Page{new_page_num}"
+    return current_page
+
+@app.callback(
+    [Output('Page1', 'style'), Output('Page2', 'style'), Output('Page3', 'style'), Output('Page4', 'style')],
+    Input('CurrentPage', 'data')
+)
+def toggle_page_visibility(current_page):
+    hidden_style = {'display': 'none'} 
+    visible_style = {'display': 'block'} 
+    styles = [hidden_style.copy() for _ in range(4)]
+    try:
+        page_num = int(current_page.replace('Page', ''))
+        if 1 <= page_num <= 4:
+            styles[page_num - 1] = visible_style
+    except ValueError: pass 
+    return styles
+
+@app.callback(
+    [Output("age-chart", "figure"), Output("class-chart", "figure"), Output("fare-chart", "figure")],
+    [Input("filter-class", "value"), Input("filter-sex", "value"), Input("filter-embarked", "value"), Input("filter-age", "value")],
+)
+def update_charts(pclass, sex, embarked, age_filter):
+    filtered = df.copy()
+    if pclass != "all":
+        try: filtered = filtered[filtered["Pclass"] == int(pclass)]
+        except: pass
+    if sex != "all": filtered = filtered[filtered["Sex"] == sex]
+    if embarked != "all": filtered = filtered[filtered["Embarked"] == embarked]
+    if age_filter != "all":
+        if age_filter == "child": filtered = filtered[filtered["Age"].le(18)]
+        elif age_filter == "adult": filtered = filtered[filtered["Age"].gt(18) & filtered["Age"].le(40)]
+        elif age_filter == "middle": filtered = filtered[filtered["Age"].gt(40) & filtered["Age"].le(60)]
+        elif age_filter == "senior": filtered = filtered[filtered["Age"].gt(60)]
+    return (create_age_chart(filtered), create_class_chart(filtered), create_fare_chart(filtered))
+
+@app.callback(
+    Output("facts-container", "children"),
+    Input("search-input", "value")
+)
+def update_facts(search):
+    filtered_facts_cards = []
+    for f in FACTS:
+        if not search or search.lower() in f["title"].lower() or search.lower() in f["text"].lower():
+            fact_card = dbc.Card([dbc.CardHeader(html.Div(f["title"], className="fact-title"), style={'background-color': '#4a617a', 'border-bottom': '1px solid #1e90ff'}), dbc.CardBody(html.P(f["text"], className="fact-text"), style={'background-color': '#34495e'})], className="mb-4", style={'border': '1px solid #1e90ff'})
+            filtered_facts_cards.append(dbc.Col(fact_card, md=4))
+    if not filtered_facts_cards:
+        return [dbc.Col(dbc.Alert("No facts found matching your search criteria.", color="warning", className="mt-3 text-center"), md=12)]
+    return filtered_facts_cards
+
+
+# ====================================================================
+# ===== CLEAR INPUTS CALLBACK ========================================
+# ====================================================================
+
+@app.callback(
+    [
+        Output("pclass_input", "value"),
+        Output("sex_input", "value"),
+        Output("age_input", "value"),
+        Output("sibsp_input", "value"),
+        Output("parch_input", "value"),
+        Output("isalone_input", "value"),
+        Output("embarked_input", "value"),
+        Output("has_cabin_input", "value"),
+        Output("prediction-output", "children") # Also clear the output
+    ],
+    Input("ClearInputsBtn", "n_clicks"),
+    prevent_initial_call=True
+)
+def clear_inputs(n_clicks):
+    """Resets all input fields and the prediction output when the clear button is clicked."""
+    if n_clicks > 0:
+        # Return a list of 'None' values corresponding to each Output, which clears the input fields.
+        return [
+            None, # pclass_input
+            None, # sex_input
+            None, # age_input
+            None, # sibsp_input
+            None, # parch_input
+            None, # isalone_input
+            None, # embarked_input
+            None, # has_cabin_input
+            dcc.Markdown("Prediction will appear here.") # prediction-output
+        ]
+    return [dash.no_update] * 9
+
+# ====================================================================
+# ===== PREDICTION CALLBACK (JOBLIB MODEL - CORRECTED) ===============
+# ====================================================================
+@app.callback(
+    Output("prediction-output", "children", allow_duplicate=True), 
+    Input("PredictSurvivalBtn", "n_clicks"),
+    [
+        State("pclass_input", "value"),
+        State("sex_input", "value"),
+        State("age_input", "value"),
+        State("sibsp_input", "value"),
+        State("parch_input", "value"),
+        State("isalone_input", "value"),
+        State("embarked_input", "value"),
+        State("has_cabin_input", "value"), 
+    ],
+    prevent_initial_call=True
+)
+def make_joblib_prediction(n_clicks, pclass, sex, age, sibsp, parch, is_alone, embarked, has_cabin):
+    
+    # --- 1. Validation ---
+    required_inputs = {"Class": pclass, "Sex": sex, "Age": age, "SibSp": sibsp, "Parch": parch, 
+                       "Is Alone": is_alone, "Embarked": embarked, "Has Cabin": has_cabin}
+    
+    missing_fields = [name for name, value in required_inputs.items() if value is None]
+    if missing_fields:
+        return dcc.Markdown(f"🚨 **ERROR:** Please fill in the required fields: {', '.join(missing_fields)}.", 
+                            style={'color': '#dc3545', 'font-size': '1.5em'})
+
+    try:
+        pclass = int(pclass)
+        sex = int(sex)
+        age = float(age)
+        sibsp = int(sibsp)
+        parch = int(parch)
+        is_alone = int(is_alone)
+        has_cabin = int(has_cabin)
+    except (ValueError, TypeError):
+        return dcc.Markdown("🚨 **ERROR:** Ensure Class, Sex, Age, and counts are valid numbers.", 
+                            style={'color': '#dc3545', 'font-size': '1.5em'})
+    
+    if not 1 <= pclass <= 3 or sex not in [0, 1] or age < 0 or has_cabin not in [0, 1] or embarked.upper() not in ['S', 'C', 'Q']:
+        return dcc.Markdown("🚨 **ERROR:** Invalid input values. Check Class (1-3), Sex (0/1), Age (>=0), Has Cabin (0/1), and Embarked (S, C, or Q).", 
+                            style={'color': '#dc3545', 'font-size': '1.5em'})
+
+    # --- 2. Data Preparation ---
+    try:
+        df_features = prepare_user_data_for_prediction(pclass, sex, age, sibsp, parch, is_alone, embarked, has_cabin) 
+    except Exception as e:
+        return dcc.Markdown(f"🚨 **DATA PREP ERROR:** Failed to prepare data for model: {e}", 
+                            style={'color': '#dc3545', 'font-size': '1.5em'})
+
+    # --- 3. Prediction ---
+    try:
+        # 🔑 CRITICAL FIX: Cast the DataFrame features to float for dtype compatibility with the model
+        df_features_float = df_features.astype(float)
+        
+        # Predict the class (0 or 1)
+        prediction = DecisionTree.predict(df_features_float)[0]
+        
+        # Predict the probabilities [prob_died, prob_survived]
+        probability_array = DecisionTree.predict_proba(df_features_float)[0]
+        prob_survived = probability_array[1]
+        
+    except Exception as e:
+        return dcc.Markdown(f"🚨 **MODEL PREDICTION ERROR:** The model failed to predict. Check if the file is correctly loaded and features are aligned. Error: {e}", 
+                            style={'color': '#dc3545', 'font-size': '1.5em'})
+
+    # --- 4. Format Output ---
+    if prediction == 1:
+        result = "**LIKELY SURVIVED** 🥳"
+        color = "#28a745" # Green
+        status_text = "The model predicts survival."
+    else:
+        result = "**LIKELY DID NOT SURVIVE** 😔"
+        color = "#dc3545" # Red
+        status_text = "The model predicts death."
+
+    output = html.Div([
+        html.H2(result, style={'color': color, 'font-size': '2em'}),
+        html.Hr(style={'border-top': '2px solid white'}),
+        html.P(f"Survival Probability: **{prob_survived:.2%}**"),
+        html.P(f"Death Probability: **{probability_array[0]:.2%}**"),
+        html.P(status_text, className='text-info'),
+        
+        html.H5("Feature Data Sent to Model:", className="mt-3"),
+        # Display the DataFrame used for prediction (transposed for better viewing)
+        dbc.Table.from_dataframe(df_features_float.T.reset_index().rename(columns={'index': 'Feature', 0: 'Value'}), 
+                                 striped=True, bordered=True, hover=True, color="secondary", 
+                                 style={'color': 'white', 'background-color': '#34495e'}),
+        # --- UPDATED COUNT IN TEXT ---
+        html.P(f"These {len(MODEL_FEATURES_EXPECTED)} features were used by the Decision Tree model for this probability calculation.", className="text-muted small")
+        # -----------------------------
+    ])
+    
+    return output
+
+
+# ===== RUN APP =====
+if __name__ == "__main__":
+    # If running locally, you must have an image named 'DTree.png' in the 'assets' folder 
+    # and possibly a dummy 'train_cleaned.csv' file in the root directory for the app to function fully.
+    # The dummy model will create a 'DecisionTree.pkl' file upon first run.
+    app.run(debug=True)
